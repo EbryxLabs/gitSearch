@@ -1,23 +1,14 @@
 import os
 import json
 import logging
+import argparse
+
 import requests
+from forestHog import get_args, validate_args, process_repo
 
 
+HEADERS = dict()
 API_BASE = 'https://api.github.com'
-ENV = {
-    'ACCESS_TOKEN': os.environ.get('ACCESS_TOKEN') or json.load(open(
-        'config.json')).get('ACCESS_TOKEN') if os.path.isfile(
-            'config.json') else exit(
-                '`ACCESS_TOKEN` or `config.json` '
-                'file having `ACCESS_TOKEN` is required.'),
-    'FILE_TOKENS': os.environ.get('FILE_TOKENS') or json.load(open(
-        'config.json')).get('FILE_TOKENS') if os.path.isfile(
-            'config.json') else exit(
-                '`FILE_TOKENS` or `config.json` '
-                'file having `FILE_TOKENS` is required.')
-}
-HEADERS = {'Authorization': 'token %s' % ENV.get('ACCESS_TOKEN')}
 
 
 logger = logging.getLogger(__name__)
@@ -28,20 +19,75 @@ handler.setFormatter(logging.Formatter('%(asctime)s: %(message)s'))
 logger.addHandler(handler)
 
 
-def get_file_tokens():
+def update_headers(args):
 
-    tokens = ENV.get('FILE_TOKENS', str()).split(',') \
-        if ENV.get('FILE_TOKENS') and isinstance(ENV.get(
-            'FILE_TOKENS'), str) else ENV.get('FILE_TOKENS', list()) \
-        if ENV.get('FILE_TOKENS') else [
-            'config.json', 'config.yml', 'config.yaml']
+    global HEADERS
+    HEADERS['Authorization'] = 'token ' + args.gtoken
 
-    logger.info('Detected file tokens: %s', ', '.join(tokens))
-    return tokens
+
+def get_params():
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gtoken', default=os.environ.get('ACCESS_TOKEN'),
+                        help='Github access token for REST API.')
+    parser.add_argument('--conf', default=os.environ.get('CONFIG_FILE'),
+                        help='config file for program.')
+    parser.add_argument('--search', help='Keyword to search in Github\'s '
+                        'all repo code.', action='append')
+    parser.add_argument('--json', dest="output_json",
+                        action="store_true", help="Output in JSON")
+    parser.add_argument("--show-regex", action="store_true",
+                        help="prints out regexes that will computed against repo")
+    parser.add_argument("--regex", dest="do_regex",
+                        action="store_true", help="Enable high signal regex checks")
+    parser.add_argument("--rules", dest="rules", default=str(),
+                        help="Ignore default regexes and source from json list file")
+    parser.add_argument("--add-rules", default=str(),
+                        help="Adds more regex rules along with default ones from a json list file")
+    parser.add_argument("--entropy", dest="do_entropy",
+                        action='store_true', help="Enable entropy checks")
+    parser.add_argument("--entropy-wc", type=int, default=20,
+                        help="Segments n-length words to check entropy against [default: 20]")
+    parser.add_argument("--entropy-b64-thresh", type=float, default=4.5,
+                        help="User defined entropy threshold for base64 strings [default: 4.5]")
+    parser.add_argument("--entropy-hex-thresh", type=float, default=3,
+                        help="User defined entropy threshold for hex strings [default: 3.0]")
+    parser.add_argument("--since-commit", dest="since_commit",
+                        default=None, help="Only scan from a given commit hash")
+    parser.add_argument("--max-depth", dest="max_depth", default=1000000,
+                        help="The max commit depth to go back when searching for secrets")
+    parser.add_argument("--branch", dest="branch", default=str(),
+                        help="Name of the branch to be scanned")
+    parser.add_argument("--repo-path", type=str, dest="repo_path", default=str(),
+                        help="Path to the cloned repo. If provided, git_url will not be used")
+    parser.add_argument("--cleanup", dest="cleanup", action="store_true",
+                        help="Clean up all temporary result files")
+
+    args = parser.parse_args()
+
+    if not args.search:
+        logger.info('No search keywork provided. Use --search '
+                    'param to provide one.')
+        exit(1)
+    if not args.gtoken:
+        logger.info('Github access token not provided. Either specify it '
+                    'using --gtoken param or use `ACCESS_TOKEN` env variable.')
+        exit(1)
+    if not args.conf:
+        logger.info('Config file not provided. Either specify it using '
+                    '--conf param or use `CONFIG_FILE` env variable.')
+        exit(1)
+    if not os.path.isfile(args.conf):
+        logger.info('Config file not found: %s', args.conf)
+        exit(1)
+
+    update_headers(args)
+    entropy_options = validate_args(args)
+    return (args, entropy_options)
 
 
 def search_code(keywords):
-    url = API_BASE + '/search/code?q=%s' % (','.join(keywords))
+    url = API_BASE + '/search/code?q=%s' % ('|'.join(keywords))
     logger.info('Searching: %s', url)
 
     res = requests.get(url, headers=HEADERS)
@@ -65,78 +111,25 @@ def search_code(keywords):
         logger.info('Unexpected response: %s', res)
 
 
-def get_latest_commit(repo, owner):
+def run_foresthog(args, options, code):
 
-    url = API_BASE + '/repos/{owner}/{repo}/commits/master' \
-        .format(owner=owner['login'], repo=repo['name'])
-
-    res = requests.get(url, headers=HEADERS)
-    if res.status_code < 400:
-        logger.info('  Latest commit is <%s>', res.json().get('sha', str()))
-        return res.json().get('sha', str())
-    else:
-        logger.info('  Could not fetch latest commit: %s', res)
-        logger.info('  %s', url)
-
-
-def search_filenames(code):
-
-    if not(code.get('sha') and code.get('repository') and code[
-            'repository'].get('owner')):
-        logger.info('<sha>, <repo> or <owner> details are missing: %s',
-                    code.get('url', 'Unknown'))
+    url = code.get('repository', dict()).get('html_url', str())
+    if not url:
+        logger.info('<repository.url> property not found: %s', code.get(
+            'repository', dict()).get('full_name'))
         return
 
-    owner = code.get('repository', dict()).get('owner', dict())
-    repo = code.get('repository', dict())
-
-    commit_sha = get_latest_commit(repo, owner)
-    if not commit_sha:
-        return
-
-    url = API_BASE + '/repos/{owner}/{repo}/git/trees/{sha}?recursive=1' \
-        .format(owner=owner['login'], repo=repo['name'], sha=commit_sha)
-
-    res = requests.get(url, headers=HEADERS)
-    if res.status_code < 400:
-        logger.info('  [%s] files found.', len(res.json().get('tree', list())))
-        return [
-            x for x in (res.json() or dict()).get('tree', list())
-            if x and x.get('type', str()) == 'blob']
-    else:
-        logger.info('  Unexpected response: %s', res)
-
-
-def filter_filenames(filenames, tokens):
-
-    logger.info('  Filtering filenames from repos...')
-
-    if not filenames:
-        logger.info('    No filenames to filter.')
-        logger.info(str())
-        return
-
-    for entry in filenames.copy():
-        eliminate = True
-        if not entry.get('path'):
-            continue
-
-        for token in tokens:
-            if token in os.path.basename(entry['path']):
-                eliminate = False
-
-        if eliminate:
-            filenames.remove(entry)
-
-    logger.info('    [%s] files remain after filtering.', len(filenames))
-    logger.info(str())
+    logger.info('Processing repo: %s', url)
+    setattr(args, 'git_url', url)
+    response = process_repo(args, options, False)
+    print(response)
 
 
 if __name__ == "__main__":
-    entries = search_code(['sample'])
+
+    args, entropy_options = get_params()
+    entries = search_code(args.search)
     exit(1) if not entries else 0
 
-    tokens = get_file_tokens()
     for entry in entries:
-        filenames = search_filenames(entry)
-        filter_filenames(filenames, tokens)
+        run_foresthog(args, entropy_options, entry)
